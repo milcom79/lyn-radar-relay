@@ -1,0 +1,15 @@
+{
+  "name": "lyn-radar-relay",
+  "version": "1.0.0",
+  "description": "Blitzortung WebSocket relay for Lyn Radar Flutter app",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

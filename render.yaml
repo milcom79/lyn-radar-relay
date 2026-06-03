@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: lyn-radar-relay
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    healthCheckPath: /health
