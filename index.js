@@ -1,9 +1,6 @@
 /**
  * Lyn Radar — Blitzortung WebSocket Relay
  *
- * Kobler til Blitzortung.org og bufrer lynnedslag i minnet.
- * Eksponerer dataene via HTTP så Flutter-appen kan polle dem.
- *
  * Endepunkter:
  *   GET /strikes  → siste 10 minutters lynnedslag (JSON)
  *   GET /health   → serverstatus
@@ -11,25 +8,20 @@
 
 const WebSocket = require('ws');
 const http      = require('http');
-const url        = require('url');
+const urlModule = require('url');
 
-// ── Konfigurasjon ────────────────────────────────────────────────────────────
-
-const PORT        = process.env.PORT || 3000;
-const MAX_AGE_MS  = 10 * 60 * 1000; // 10 minutter
+const PORT       = process.env.PORT || 3000;
+const MAX_AGE_MS = 10 * 60 * 1000;
 
 const SERVERS = [
   'wss://ws1.blitzortung.org:443/',
   'wss://ws8.blitzortung.org:443/',
   'wss://ws2.blitzortung.org:443/',
   'wss://ws.blitzortung.org:443/',
-  // ws3 fjernet — SSL-sertifikat matcher ikke hostnavnet
 ];
 
 const SUBSCRIPTIONS = [
-  // Enkelt format (eldre klienter, akeamc/blitzortung)
   '{"west":-180,"east":180,"south":-90,"north":90}',
-  // Fullformat med versjonsnummer (lightningmaps.org v24)
   JSON.stringify({
     v:24, r:'A', i:{}, s:0, x:0, w:0, tx:0, tw:1,
     a:0, z:6, b:true, h:'', l:0, t:0,
@@ -38,38 +30,44 @@ const SUBSCRIPTIONS = [
   }),
 ];
 
-// ── Tilstandsvariabler ────────────────────────────────────────────────────────
+// ── Tilstand ─────────────────────────────────────────────────────────────────
 
-let recentStrikes   = [];
-let serverIndex     = 0;
-let subIndex        = 0;
-let connected       = false;
-let totalReceived   = 0;
+let recentStrikes  = [];
+let serverIndex    = 0;
+let subIndex       = 0;
+let connected      = false;
+let totalReceived  = 0;
+let isConnecting   = false;   // ← forhindrer simultane tilkoblinger
 
 // ── Blitzortung-tilkobling ────────────────────────────────────────────────────
 
 function connectBlitzortung() {
-  const serverUrl  = SERVERS[serverIndex % SERVERS.length];
-  const sub        = SUBSCRIPTIONS[subIndex % SUBSCRIPTIONS.length];
+  if (isConnecting) return;          // allerede i gang
+  isConnecting = true;
+
+  const serverUrl = SERVERS[serverIndex % SERVERS.length];
+  const sub       = SUBSCRIPTIONS[subIndex % SUBSCRIPTIONS.length];
   console.log(`[Relay] Prøver: ${serverUrl}`);
 
   let ws;
   try {
     ws = new WebSocket(serverUrl, {
       headers: { 'Origin': 'https://www.lightningmaps.org' },
-      handshakeTimeout: 8000,
+      handshakeTimeout: 10000,
     });
   } catch (e) {
     console.error('[Relay] Tilkoblingsfeil:', e.message);
-    scheduleReconnect();
+    isConnecting = false;
+    serverIndex++;
+    setTimeout(connectBlitzortung, 8000);
     return;
   }
 
   let dataReceived = false;
   let pingInterval;
+  let altSubSent   = false;
 
-  // Bytt server kun hvis ingen data etter 3 minutter
-  // (Blitzortung kan ha lange burst-intervaller)
+  // Bytt server etter 3 minutter uten data
   const noDataTimeout = setTimeout(() => {
     if (!dataReceived) {
       console.log('[Relay] Ingen data etter 3min, bytter server...');
@@ -79,122 +77,99 @@ function connectBlitzortung() {
 
   ws.on('open', () => {
     console.log(`[Relay] Tilkoblet: ${serverUrl}`);
-    // Send begge subscription-formater med litt mellomrom
     ws.send(sub);
-    setTimeout(() => {
-      if (ws.readyState === WebSocket.OPEN && !dataReceived) {
-        const altSub = SUBSCRIPTIONS[(subIndex + 1) % SUBSCRIPTIONS.length];
-        ws.send(altSub);
-        console.log('[Relay] Sendte alternativ subscription');
-      }
-    }, 5000);
 
-    // Ping for å holde forbindelsen åpen
-    pingInterval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.ping();
+    // Send alternativ subscription etter 8 sekunder
+    setTimeout(() => {
+      if (ws.readyState === WebSocket.OPEN && !dataReceived && !altSubSent) {
+        altSubSent = true;
+        const alt = SUBSCRIPTIONS[(subIndex + 1) % SUBSCRIPTIONS.length];
+        ws.send(alt);
+        console.log('[Relay] Prøver alternativ subscription...');
       }
+    }, 8000);
+
+    pingInterval = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.ping();
     }, 25000);
   });
 
   ws.on('message', (data) => {
     let msg;
-    try { msg = JSON.parse(data.toString()); }
-    catch (_) { return; }
+    try { msg = JSON.parse(data.toString()); } catch (_) { return; }
 
-    // Challenge-response (anti-scraping mekanisme)
+    // Challenge-response
     if (msg.k !== undefined) {
       const k   = parseFloat(msg.k);
       const ans = ((k * 3604) % 7081) * Date.now() / 100;
       ws.send(`{"k": ${Math.round(ans)} }`);
     }
 
-    // Lynnedslag
     const strokes = msg.strokes;
     if (Array.isArray(strokes) && strokes.length > 0) {
-      const now = Date.now();
       for (const s of strokes) {
         if (s.lat !== undefined && s.lon !== undefined && s.time) {
-          recentStrikes.push({
-            lat: s.lat,
-            lon: s.lon,
-            time: s.time,   // nanosekunder
-            mds: s.mds || 5,
-          });
+          recentStrikes.push({ lat: s.lat, lon: s.lon, time: s.time, mds: s.mds || 5 });
           totalReceived++;
         }
       }
-      // Rydd ut gamle slag
-      const cutoff = now - MAX_AGE_MS;
+      // Rydd gamle slag
+      const cutoff = Date.now() - MAX_AGE_MS;
       recentStrikes = recentStrikes.filter(s => s.time / 1e6 > cutoff);
 
       if (!dataReceived) {
         dataReceived = true;
         connected    = true;
         clearTimeout(noDataTimeout);
-        console.log(`[Relay] ✓ Data strømmer! Mottok ${strokes.length} slag`);
-      } else if (totalReceived % 50 === 0) {
+        console.log(`[Relay] ✓ Data strømmer! ${strokes.length} slag`);
+      } else if (totalReceived % 100 === 0) {
         console.log(`[Relay] ${recentStrikes.length} slag i buffer, totalt ${totalReceived}`);
       }
     }
   });
 
-  ws.on('close', (code, reason) => {
+  // Kun én av close/error håndterer reconnect
+  let reconnectDone = false;
+  function handleClose(reason) {
+    if (reconnectDone) return;
+    reconnectDone = true;
     clearInterval(pingInterval);
     clearTimeout(noDataTimeout);
-    connected = false;
-    console.log(`[Relay] Lukket (${code}): ${reason || 'ingen årsak'}`);
+    connected    = false;
+    isConnecting = false;
+    console.log(`[Relay] ${reason} — venter 8s før nytt forsøk`);
     serverIndex++;
     subIndex++;
-    scheduleReconnect();
-  });
+    setTimeout(connectBlitzortung, 8000);
+  }
 
-  ws.on('error', (e) => {
-    clearInterval(pingInterval);
-    clearTimeout(noDataTimeout);
-    connected = false;
-    console.error('[Relay] Feil:', e.message);
-    serverIndex++;
-    scheduleReconnect();
-  });
-}
-
-function scheduleReconnect() {
-  setTimeout(connectBlitzortung, 5000);
+  ws.on('close', (code) => handleClose(`Lukket (${code})`));
+  ws.on('error', (e)    => handleClose(`Feil: ${e.message}`));
 }
 
 // ── HTTP-server ───────────────────────────────────────────────────────────────
 
 const server = http.createServer((req, res) => {
-  const path = url.parse(req.url).pathname;
-
-  // CORS for Flutter-appen
+  const path = urlModule.parse(req.url).pathname;
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Content-Type', 'application/json');
 
   if (path === '/strikes') {
-    // Rydd gamle slag
     const cutoff = Date.now() - MAX_AGE_MS;
     recentStrikes = recentStrikes.filter(s => s.time / 1e6 > cutoff);
-
     res.writeHead(200);
     res.end(JSON.stringify({
-      strikes:   recentStrikes,
-      count:     recentStrikes.length,
-      connected: connected,
-      timestamp: Date.now(),
+      strikes: recentStrikes, count: recentStrikes.length,
+      connected, timestamp: Date.now(),
     }));
-
   } else if (path === '/health') {
     res.writeHead(200);
     res.end(JSON.stringify({
-      status:         'ok',
-      connected:      connected,
+      status: 'ok', connected,
       strikes_cached: recentStrikes.length,
       total_received: totalReceived,
-      uptime_sec:     Math.round(process.uptime()),
+      uptime_sec: Math.round(process.uptime()),
     }));
-
   } else {
     res.writeHead(404);
     res.end(JSON.stringify({ error: 'Not found' }));
@@ -205,12 +180,10 @@ server.listen(PORT, () => {
   console.log(`[Relay] HTTP-server kjører på port ${PORT}`);
   connectBlitzortung();
 
-  // Keep-alive: ping oss selv hvert 14. minutt
-  // (hindrer Render free-tier fra å sove)
+  // Keep-alive: hindrer Render fra å sove etter 15 min inaktivitet
   setInterval(() => {
-    const opts = { host: 'localhost', port: PORT, path: '/health' };
-    http.get(opts, (r) => {
-      console.log(`[Relay] Keep-alive ping → status ${r.statusCode}`);
+    http.get({ host: 'localhost', port: PORT, path: '/health' }, () => {
+      console.log('[Relay] Keep-alive ping OK');
     }).on('error', () => {});
   }, 14 * 60 * 1000);
 });
