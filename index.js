@@ -22,8 +22,8 @@ const SERVERS = [
   'wss://ws1.blitzortung.org:443/',
   'wss://ws8.blitzortung.org:443/',
   'wss://ws2.blitzortung.org:443/',
-  'wss://ws3.blitzortung.org:443/',
   'wss://ws.blitzortung.org:443/',
+  // ws3 fjernet — SSL-sertifikat matcher ikke hostnavnet
 ];
 
 const SUBSCRIPTIONS = [
@@ -68,17 +68,26 @@ function connectBlitzortung() {
   let dataReceived = false;
   let pingInterval;
 
-  // Timeout: ingen data innen 20 sekunder → bytt server
+  // Bytt server kun hvis ingen data etter 3 minutter
+  // (Blitzortung kan ha lange burst-intervaller)
   const noDataTimeout = setTimeout(() => {
     if (!dataReceived) {
-      console.log('[Relay] Ingen data etter 20s, bytter server...');
+      console.log('[Relay] Ingen data etter 3min, bytter server...');
       ws.terminate();
     }
-  }, 20000);
+  }, 3 * 60 * 1000);
 
   ws.on('open', () => {
     console.log(`[Relay] Tilkoblet: ${serverUrl}`);
+    // Send begge subscription-formater med litt mellomrom
     ws.send(sub);
+    setTimeout(() => {
+      if (ws.readyState === WebSocket.OPEN && !dataReceived) {
+        const altSub = SUBSCRIPTIONS[(subIndex + 1) % SUBSCRIPTIONS.length];
+        ws.send(altSub);
+        console.log('[Relay] Sendte alternativ subscription');
+      }
+    }, 5000);
 
     // Ping for å holde forbindelsen åpen
     pingInterval = setInterval(() => {
