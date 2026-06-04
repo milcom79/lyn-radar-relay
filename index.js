@@ -16,7 +16,7 @@ const http   = require('http');
 const urlMod = require('url');
 
 const PORT       = process.env.PORT || 3000;
-const MAX_AGE_MS = 10 * 60 * 1000;
+const MAX_AGE_MS = 30 * 60 * 1000;
 
 const MQTT_HOST  = 'mqtt://blitzortung.ha.sed.pl:1883';
 const MQTT_TOPIC = 'blitzortung/1.1/#';
