@@ -52,17 +52,27 @@ function connectMQTT() {
     try {
       const msg = JSON.parse(payload.toString());
 
-      // Blitzortung MQTT-format: {lat, lon, time (nanosek), alt, ...}
       if (msg.lat === undefined || msg.lon === undefined) return;
 
-      const now   = Date.now();
+      const now    = Date.now();
       const timeNs = msg.time || (now * 1e6);
+
+      // Logg råfelt de første 3 meldingene for å identifisere kA-felt
+      if (totalReceived < 3) {
+        console.log('[Relay] Råfelt:', JSON.stringify(msg));
+      }
+
+      // Blitzortung MQTT bruker 'mds' (stations) — 0 er gyldig (ikke default til 5)
+      // Sjekk også alternativt feltnavn 'mcg' (magnitude category)
+      const mds = (msg.mds !== undefined && msg.mds !== null) ? msg.mds : null;
 
       recentStrikes.push({
         lat:  msg.lat,
         lon:  msg.lon,
         time: timeNs,
-        mds:  msg.mds || 5,
+        mds:  mds,          // null = ikke tilgjengelig
+        pol:  msg.pol,      // polaritet (-1 CG ned, 1 CG opp)
+        alt:  msg.alt,      // høyde
       });
       totalReceived++;
 
