@@ -143,8 +143,10 @@ server.listen(PORT, () => {
   console.log(`[Relay] HTTP-server på port ${PORT}`);
   connectMQTT();
 
-  // Keep-alive
+  // Keep-alive hvert 10. minutt — Render sover etter 15 min inaktivitet
   setInterval(() => {
-    http.get({ host: 'localhost', port: PORT, path: '/health' }, () => {}).on('error', () => {});
-  }, 14 * 60 * 1000);
+    http.get({ host: 'localhost', port: PORT, path: '/health' }, (res) => {
+      console.log(`[Relay] Keep-alive: ${res.statusCode}, slag=${recentStrikes.length}`);
+    }).on('error', () => {});
+  }, 10 * 60 * 1000);
 });
