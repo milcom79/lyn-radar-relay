@@ -1,6 +1,7 @@
 /**
- * Lyn Radar — MET Norway Frost Lightning Relay
+ * Lyn Radar — MET Norway Frost Lightning Relay + Blitzortung global relay
  *
+ * MET Frost (Norden):
  * Henter lynnedslag fra MET Norways Frost API (samme nettverk/datakilde
  * som radarkartet på yr.no bruker), i stedet for Blitzortung.
  *
@@ -11,13 +12,20 @@
  * Krever miljøvariabelen FROST_CLIENT_ID (gratis client-ID fra
  * https://frost.met.no/auth/requestCredentials.html).
  *
- * GET /strikes → siste 60 min lynnedslag
- * GET /health  → serverstatus
+ * Blitzortung (resten av verden, i tillegg til MET):
+ * Kobler til Blitzortung sitt globale MQTT-endepunkt og holder en egen
+ * buffer med slag UTENFOR det nordiske dekningsområdet (samme polygon som
+ * Frost-spørringen), slik at de to kildene ikke overlapper.
+ *
+ * GET /strikes        → siste 60 min lynnedslag, Norden (MET Frost)
+ * GET /strikes-global → siste 60 min lynnedslag, resten av verden (Blitzortung)
+ * GET /health         → serverstatus for begge kilder
  */
 
 const https  = require('https');
 const http   = require('http');
 const urlMod = require('url');
+const mqtt   = require('mqtt');
 
 const PORT       = process.env.PORT || 3000;
 const CLIENT_ID  = process.env.FROST_CLIENT_ID;
@@ -30,6 +38,12 @@ const POLL_INTERVAL_MS  = 20 * 1000;
 const PUBLISH_LAG_MS   = 60 * 1000;
 // Nordisk dekningsområde — samme region som yr-maps radar dekker.
 const GEOMETRY = 'POLYGON((-8 53, -8 74, 41 74, 41 53, -8 53))';
+// Samme område som bounding box — brukes til å luke ut Blitzortung-slag som
+// MET Frost allerede dekker, slik at kildene ikke overlapper.
+const NORDIC_BOUNDS = { minLon: -8, maxLon: 41, minLat: 53, maxLat: 74 };
+
+const MQTT_HOST  = 'mqtt://blitzortung.ha.sed.pl:1883';
+const MQTT_TOPIC = 'blitzortung/1.1/#';
 
 // ── Tilstand ─────────────────────────────────────────────────────────────────
 
@@ -38,6 +52,11 @@ let totalReceived = 0;
 let connected     = false;
 let lastError     = null;
 let lastFetchTo   = new Date(Date.now() - 5 * 60 * 1000); // liten backfill ved start
+
+let recentGlobalStrikes = [];
+let globalTotalReceived = 0;
+let globalConnected     = false;
+let globalLastError     = null;
 
 // ── Frost-polling ─────────────────────────────────────────────────────────────
 
@@ -141,6 +160,67 @@ function parseUalf(body) {
   }
 }
 
+// ── Blitzortung MQTT (global, utenfor Norden) ───────────────────────────────────
+
+function isNordic(lat, lon) {
+  return lat >= NORDIC_BOUNDS.minLat && lat <= NORDIC_BOUNDS.maxLat
+      && lon >= NORDIC_BOUNDS.minLon && lon <= NORDIC_BOUNDS.maxLon;
+}
+
+function connectBlitzortung() {
+  const client = mqtt.connect(MQTT_HOST, {
+    clientId:        `lyn-relay-${Math.random().toString(16).slice(2, 8)}`,
+    keepalive:       60,
+    reconnectPeriod: 5000,
+    connectTimeout:  10000,
+  });
+
+  client.on('connect', () => {
+    globalConnected = true;
+    globalLastError = null;
+    client.subscribe(MQTT_TOPIC, { qos: 0 }, (err) => {
+      if (err) {
+        globalLastError = err.message;
+        console.error('[Relay] Blitzortung-abonnementsfeil:', err.message);
+      }
+    });
+  });
+
+  client.on('message', (topic, payload) => {
+    let msg;
+    try {
+      msg = JSON.parse(payload.toString());
+    } catch {
+      return;
+    }
+    if (msg.lat === undefined || msg.lon === undefined) return;
+    if (isNordic(msg.lat, msg.lon)) return; // dekkes allerede av MET Frost
+
+    const timeNs = msg.time || (Date.now() * 1e6);
+    recentGlobalStrikes.push({
+      lat:       msg.lat,
+      lon:       msg.lon,
+      time:      timeNs,
+      mds:       (msg.mds !== undefined && msg.mds !== null) ? msg.mds : null,
+      intensity: 0, // Blitzortung gir ikke toppstrøm (kA)
+    });
+    globalTotalReceived++;
+
+    if (recentGlobalStrikes.length > 5000) {
+      const cutoff = Date.now() - MAX_AGE_MS;
+      recentGlobalStrikes = recentGlobalStrikes.filter(s => s.time / 1e6 > cutoff);
+    }
+  });
+
+  client.on('reconnect', () => { globalConnected = false; });
+  client.on('offline',   () => { globalConnected = false; });
+  client.on('error', (e) => {
+    globalConnected = false;
+    globalLastError = e.message;
+    console.error('[Relay] Blitzortung-tilkoblingsfeil:', e.message);
+  });
+}
+
 // ── HTTP-server ───────────────────────────────────────────────────────────────
 
 const server = http.createServer((req, res) => {
@@ -160,6 +240,18 @@ const server = http.createServer((req, res) => {
       source:    'met-frost-lightning',
       timestamp: Date.now(),
     }));
+  } else if (path === '/strikes-global') {
+    const cutoff = Date.now() - MAX_AGE_MS;
+    const fresh  = recentGlobalStrikes.filter(s => s.time / 1e6 > cutoff);
+    recentGlobalStrikes = fresh;
+    res.writeHead(200);
+    res.end(JSON.stringify({
+      strikes:   fresh,
+      count:     fresh.length,
+      connected: globalConnected,
+      source:    'blitzortung-mqtt-global',
+      timestamp: Date.now(),
+    }));
   } else if (path === '/health') {
     res.writeHead(200);
     res.end(JSON.stringify({
@@ -169,6 +261,14 @@ const server = http.createServer((req, res) => {
       strikes_cached: recentStrikes.length,
       total_received: totalReceived,
       last_error:     lastError,
+      global: {
+        status:         globalConnected ? 'ok' : 'error',
+        connected:      globalConnected,
+        source:         'blitzortung-mqtt-global',
+        strikes_cached: recentGlobalStrikes.length,
+        total_received: globalTotalReceived,
+        last_error:     globalLastError,
+      },
       uptime_sec:     Math.round(process.uptime()),
     }));
   } else {
@@ -182,10 +282,12 @@ server.listen(PORT, () => {
   pollFrost();
   setInterval(pollFrost, POLL_INTERVAL_MS);
 
+  connectBlitzortung();
+
   // Keep-alive hvert 10. minutt — Render sover etter 15 min inaktivitet
   setInterval(() => {
     http.get({ host: 'localhost', port: PORT, path: '/health' }, (res) => {
-      console.log(`[Relay] Keep-alive: ${res.statusCode}, slag=${recentStrikes.length}, tilkoblet=${connected}`);
+      console.log(`[Relay] Keep-alive: ${res.statusCode}, slag=${recentStrikes.length}, tilkoblet=${connected}, global=${recentGlobalStrikes.length}`);
     }).on('error', () => {});
   }, 10 * 60 * 1000);
 });
