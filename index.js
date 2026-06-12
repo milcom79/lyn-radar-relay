@@ -11,7 +11,7 @@
  * Krever miljøvariabelen FROST_CLIENT_ID (gratis client-ID fra
  * https://frost.met.no/auth/requestCredentials.html).
  *
- * GET /strikes → siste 30 min lynnedslag
+ * GET /strikes → siste 60 min lynnedslag
  * GET /health  → serverstatus
  */
 
@@ -21,7 +21,7 @@ const urlMod = require('url');
 
 const PORT       = process.env.PORT || 3000;
 const CLIENT_ID  = process.env.FROST_CLIENT_ID;
-const MAX_AGE_MS = 30 * 60 * 1000;
+const MAX_AGE_MS = 60 * 60 * 1000;
 
 const FROST_HOST     = 'frost-rc.met.no';
 const POLL_INTERVAL_MS  = 20 * 1000;
