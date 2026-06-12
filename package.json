@@ -1,15 +1,12 @@
 {
   "name": "lyn-radar-relay",
   "version": "1.0.0",
-  "description": "Blitzortung MQTT relay for Lyn Radar Flutter app",
+  "description": "MET Norway Frost lightning relay for Lyn Radar Flutter app",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "engines": {
     "node": ">=18.0.0"
-  },
-  "dependencies": {
-    "mqtt": "^5.10.1"
   }
 }

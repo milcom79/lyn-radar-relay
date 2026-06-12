@@ -6,3 +6,6 @@ services:
     buildCommand: npm install
     startCommand: node index.js
     healthCheckPath: /health
+    envVars:
+      - key: FROST_CLIENT_ID
+        sync: false

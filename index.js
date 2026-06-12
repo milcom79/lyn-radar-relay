@@ -1,107 +1,144 @@
 /**
- * Lyn Radar — Blitzortung MQTT Relay
+ * Lyn Radar — MET Norway Frost Lightning Relay
  *
- * Kobler til Blitzortung sitt MQTT-endepunkt (ikke WebSocket).
- * Kilde: github.com/zacharyd3/Blitz-lightningtracker og ha-blitzortung.
+ * Henter lynnedslag fra MET Norways Frost API (samme nettverk/datakilde
+ * som radarkartet på yr.no bruker), i stedet for Blitzortung.
  *
- * MQTT-broker: blitzortung.ha.sed.pl:1883
- * Topic:       blitzortung/1.1/#  (globale slag)
+ * GET https://frost-rc.met.no/api/v1/lightning/get
+ *   ?referencetime=<from>/<to>&format=ualf&geometry=POLYGON(...)
+ *   Basic Auth: <FROST_CLIENT_ID>:
  *
- * GET /strikes  → siste 10 min lynnedslag
- * GET /health   → serverstatus
+ * Krever miljøvariabelen FROST_CLIENT_ID (gratis client-ID fra
+ * https://frost.met.no/auth/requestCredentials.html).
+ *
+ * GET /strikes → siste 30 min lynnedslag
+ * GET /health  → serverstatus
  */
 
-const mqtt   = require('mqtt');
+const https  = require('https');
 const http   = require('http');
 const urlMod = require('url');
 
 const PORT       = process.env.PORT || 3000;
+const CLIENT_ID  = process.env.FROST_CLIENT_ID;
 const MAX_AGE_MS = 30 * 60 * 1000;
 
-const MQTT_HOST  = 'mqtt://blitzortung.ha.sed.pl:1883';
-const MQTT_TOPIC = 'blitzortung/1.1/#';
+const FROST_HOST     = 'frost-rc.met.no';
+const POLL_INTERVAL_MS  = 20 * 1000;
+// Frost-data kan komme med litt forsinkelse — vent med å "kreve" et
+// tidspunkt til det er minst dette gamalt.
+const PUBLISH_LAG_MS   = 60 * 1000;
+// Nordisk dekningsområde — samme region som yr-maps radar dekker.
+const GEOMETRY = 'POLYGON((-8 53, -8 74, 41 74, 41 53, -8 53))';
 
 // ── Tilstand ─────────────────────────────────────────────────────────────────
 
 let recentStrikes = [];
 let totalReceived = 0;
 let connected     = false;
+let lastError     = null;
+let lastFetchTo   = new Date(Date.now() - 5 * 60 * 1000); // liten backfill ved start
 
-// ── MQTT-tilkobling ───────────────────────────────────────────────────────────
+// ── Frost-polling ─────────────────────────────────────────────────────────────
 
-function connectMQTT() {
-  console.log(`[Relay] Kobler til MQTT: ${MQTT_HOST}`);
+function pollFrost() {
+  if (!CLIENT_ID) {
+    lastError = 'FROST_CLIENT_ID er ikke satt';
+    connected = false;
+    return;
+  }
 
-  const client = mqtt.connect(MQTT_HOST, {
-    clientId:       `lyn-relay-${Math.random().toString(16).slice(2, 8)}`,
-    keepalive:      60,
-    reconnectPeriod: 5000,
-    connectTimeout: 10000,
-  });
+  const to = new Date(Date.now() - PUBLISH_LAG_MS);
+  if (to <= lastFetchTo) return; // for tidlig — ingen ny periode klar enda
 
-  client.on('connect', () => {
-    connected = true;
-    console.log('[Relay] ✓ MQTT tilkoblet!');
-    client.subscribe(MQTT_TOPIC, { qos: 0 }, (err) => {
-      if (err) console.error('[Relay] Subscribe-feil:', err.message);
-      else console.log(`[Relay] Abonnerer på: ${MQTT_TOPIC}`);
+  const from = lastFetchTo;
+  const refTime = `${from.toISOString()}/${to.toISOString()}`;
+  const path = `/api/v1/lightning/get`
+    + `?referencetime=${encodeURIComponent(refTime)}`
+    + `&format=ualf`
+    + `&geometry=${encodeURIComponent(GEOMETRY)}`;
+
+  const auth = Buffer.from(`${CLIENT_ID}:`).toString('base64');
+
+  const req = https.get({
+    host: FROST_HOST,
+    path,
+    headers: { Authorization: `Basic ${auth}` },
+    timeout: 20000,
+  }, (res) => {
+    let body = '';
+    res.setEncoding('utf8');
+    res.on('data', (chunk) => { body += chunk; });
+    res.on('end', () => {
+      if (res.statusCode !== 200) {
+        connected = false;
+        lastError = `HTTP ${res.statusCode}: ${body.slice(0, 300)}`;
+        console.error(`[Relay] Frost-feil: ${lastError}`);
+        return;
+      }
+      connected = true;
+      lastError = null;
+      lastFetchTo = to;
+      parseUalf(body);
     });
   });
 
-  client.on('message', (topic, payload) => {
-    try {
-      const msg = JSON.parse(payload.toString());
-
-      if (msg.lat === undefined || msg.lon === undefined) return;
-
-      const now    = Date.now();
-      const timeNs = msg.time || (now * 1e6);
-
-      // Logg råfelt de første 3 meldingene for å identifisere kA-felt
-      if (totalReceived < 3) {
-        console.log('[Relay] Råfelt:', JSON.stringify(msg));
-      }
-
-      // Blitzortung MQTT bruker 'mds' (stations) — 0 er gyldig (ikke default til 5)
-      // Sjekk også alternativt feltnavn 'mcg' (magnitude category)
-      const mds = (msg.mds !== undefined && msg.mds !== null) ? msg.mds : null;
-
-      recentStrikes.push({
-        lat:  msg.lat,
-        lon:  msg.lon,
-        time: timeNs,
-        mds:  mds,          // null = ikke tilgjengelig
-        pol:  msg.pol,      // polaritet (-1 CG ned, 1 CG opp)
-        alt:  msg.alt,      // høyde
-      });
-      totalReceived++;
-
-      // Rydd gamle slag
-      const cutoff = now - MAX_AGE_MS;
-      if (recentStrikes.length > 5000) {
-        recentStrikes = recentStrikes.filter(s => s.time / 1e6 > cutoff);
-      }
-
-      if (totalReceived <= 5 || totalReceived % 100 === 0) {
-        console.log(`[Relay] ⚡ slag #${totalReceived}: lat=${msg.lat.toFixed(3)}, lon=${msg.lon.toFixed(3)} | buffer=${recentStrikes.length}`);
-      }
-    } catch (_) {}
-  });
-
-  client.on('reconnect', () => {
+  req.on('error', (e) => {
     connected = false;
-    console.log('[Relay] Kobler til på nytt...');
+    lastError = e.message;
+    console.error('[Relay] Frost-tilkoblingsfeil:', e.message);
   });
 
-  client.on('offline', () => {
-    connected = false;
-    console.log('[Relay] MQTT offline');
-  });
+  req.on('timeout', () => req.destroy());
+}
 
-  client.on('error', (e) => {
-    connected = false;
-    console.error('[Relay] MQTT-feil:', e.message);
-  });
+/**
+ * Parser UALF-linjer (ett lynnedslag per linje, felt separert med
+ * mellomrom). Feltindeks (0-basert): 1=år 2=måned 3=dag 4=time 5=min
+ * 6=sek 7=nanosek 8=lat 9=lon 10=toppstrøm(kA) 11=multiplisitet
+ * 12=antall sensorer.
+ */
+function parseUalf(body) {
+  for (const line of body.split('\n')) {
+    const f = line.trim().split(/\s+/);
+    if (f.length < 13) continue;
+
+    const year   = parseInt(f[1], 10);
+    const month  = parseInt(f[2], 10);
+    const day    = parseInt(f[3], 10);
+    const hour   = parseInt(f[4], 10);
+    const minute = parseInt(f[5], 10);
+    const second = parseInt(f[6], 10);
+    const nanos  = parseInt(f[7], 10);
+    const lat    = parseFloat(f[8]);
+    const lon    = parseFloat(f[9]);
+    const peakCurrentKa = parseFloat(f[10]);
+    const multiplicity  = parseInt(f[11], 10);
+    const sensors       = parseInt(f[12], 10);
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+
+    const ms = Date.UTC(year, month - 1, day, hour, minute, second);
+    if (!Number.isFinite(ms)) continue;
+    const timeNs = ms * 1e6 + (Number.isFinite(nanos) ? nanos : 0);
+
+    recentStrikes.push({
+      lat,
+      lon,
+      time: timeNs,
+      mds: Number.isFinite(sensors) ? sensors : null,
+      intensity: Number.isFinite(peakCurrentKa) ? Math.abs(peakCurrentKa) : 0,
+      multiplicity: Number.isFinite(multiplicity) ? multiplicity : null,
+    });
+    totalReceived++;
+  }
+
+  const cutoff = Date.now() - MAX_AGE_MS;
+  recentStrikes = recentStrikes.filter(s => s.time / 1e6 > cutoff);
+
+  if (totalReceived > 0) {
+    console.log(`[Relay] ⚡ totalt ${totalReceived} slag mottatt | buffer=${recentStrikes.length}`);
+  }
 }
 
 // ── HTTP-server ───────────────────────────────────────────────────────────────
@@ -120,17 +157,18 @@ const server = http.createServer((req, res) => {
       strikes:   fresh,
       count:     fresh.length,
       connected: connected,
-      source:    'blitzortung-mqtt',
+      source:    'met-frost-lightning',
       timestamp: Date.now(),
     }));
   } else if (path === '/health') {
     res.writeHead(200);
     res.end(JSON.stringify({
-      status:         'ok',
+      status:         connected ? 'ok' : 'error',
       connected:      connected,
-      source:         'blitzortung-mqtt',
+      source:         'met-frost-lightning',
       strikes_cached: recentStrikes.length,
       total_received: totalReceived,
+      last_error:     lastError,
       uptime_sec:     Math.round(process.uptime()),
     }));
   } else {
@@ -141,12 +179,13 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`[Relay] HTTP-server på port ${PORT}`);
-  connectMQTT();
+  pollFrost();
+  setInterval(pollFrost, POLL_INTERVAL_MS);
 
   // Keep-alive hvert 10. minutt — Render sover etter 15 min inaktivitet
   setInterval(() => {
     http.get({ host: 'localhost', port: PORT, path: '/health' }, (res) => {
-      console.log(`[Relay] Keep-alive: ${res.statusCode}, slag=${recentStrikes.length}`);
+      console.log(`[Relay] Keep-alive: ${res.statusCode}, slag=${recentStrikes.length}, tilkoblet=${connected}`);
     }).on('error', () => {});
   }, 10 * 60 * 1000);
 });
