@@ -20,6 +20,10 @@
  * GET /strikes        → siste 60 min lynnedslag, Norden (MET Frost)
  * GET /strikes-global → siste 60 min lynnedslag, resten av verden (Blitzortung)
  * GET /health         → serverstatus for begge kilder
+ *
+ * POST /report-image  → sender e-post (via Resend) om et rapportert bilde
+ *   Body (JSON): { reportId, imageUrl, posterInfo?, reason? }
+ *   Krever miljøvariabelen RESEND_API_KEY (gratis API-key fra resend.com).
  */
 
 const https  = require('https');
@@ -30,6 +34,9 @@ const mqtt   = require('mqtt');
 const PORT       = process.env.PORT || 3000;
 const CLIENT_ID  = process.env.FROST_CLIENT_ID;
 const MAX_AGE_MS = 60 * 60 * 1000;
+
+const RESEND_API_KEY  = process.env.RESEND_API_KEY;
+const REPORT_EMAIL_TO = 'dinutvikler@gmail.com';
 
 const FROST_HOST     = 'frost-rc.met.no';
 const POLL_INTERVAL_MS  = 20 * 1000;
@@ -221,12 +228,110 @@ function connectBlitzortung() {
   });
 }
 
+// ── Rapporter bilde (e-post via Resend) ────────────────────────────────────────
+
+function readBody(req, cb) {
+  let body = '';
+  req.on('data', (chunk) => {
+    body += chunk;
+    if (body.length > 1e6) req.destroy();
+  });
+  req.on('end', () => cb(body));
+}
+
+function sendReportEmail({ reportId, imageUrl, posterInfo, reason }, cb) {
+  if (!RESEND_API_KEY) {
+    cb(new Error('RESEND_API_KEY er ikke satt'));
+    return;
+  }
+
+  const text = 'En bruker har rapportert et bilde for fjerning.\n\n'
+    + `Rapport-ID: ${reportId}\n`
+    + `Bilde-URL: ${imageUrl}\n`
+    + `Lagt ut av: ${posterInfo || 'Ukjent'}\n`
+    + (reason ? `\nÅrsak:\n${reason}\n` : '');
+
+  const payload = JSON.stringify({
+    from:    'Lyn Radar <onboarding@resend.dev>',
+    to:      [REPORT_EMAIL_TO],
+    subject: 'Rapportert bilde – Lyn Radar',
+    text,
+  });
+
+  const req = https.request({
+    host: 'api.resend.com',
+    path: '/emails',
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${RESEND_API_KEY}`,
+      'Content-Type':  'application/json',
+      'Content-Length': Buffer.byteLength(payload),
+    },
+    timeout: 15000,
+  }, (res) => {
+    let body = '';
+    res.on('data', (c) => { body += c; });
+    res.on('end', () => {
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        cb(null);
+      } else {
+        cb(new Error(`Resend HTTP ${res.statusCode}: ${body.slice(0, 300)}`));
+      }
+    });
+  });
+
+  req.on('error', cb);
+  req.on('timeout', () => req.destroy());
+  req.write(payload);
+  req.end();
+}
+
 // ── HTTP-server ───────────────────────────────────────────────────────────────
 
 const server = http.createServer((req, res) => {
   const path = urlMod.parse(req.url).pathname;
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Content-Type', 'application/json');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  if (path === '/report-image' && req.method === 'POST') {
+    readBody(req, (raw) => {
+      let data;
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'Ugyldig JSON' }));
+        return;
+      }
+
+      const { reportId, imageUrl, posterInfo, reason } = data || {};
+      if (!reportId || !imageUrl) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'reportId og imageUrl er påkrevd' }));
+        return;
+      }
+
+      sendReportEmail({ reportId, imageUrl, posterInfo, reason }, (err) => {
+        if (err) {
+          console.error('[Relay] report-image-feil:', err.message);
+          res.writeHead(502);
+          res.end(JSON.stringify({ error: err.message }));
+        } else {
+          res.writeHead(200);
+          res.end(JSON.stringify({ ok: true }));
+        }
+      });
+    });
+    return;
+  }
 
   if (path === '/strikes') {
     const cutoff = Date.now() - MAX_AGE_MS;
