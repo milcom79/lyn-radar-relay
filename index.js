@@ -29,6 +29,7 @@
 const https  = require('https');
 const http   = require('http');
 const urlMod = require('url');
+const zlib   = require('zlib');
 const mqtt   = require('mqtt');
 
 const PORT       = process.env.PORT || 3000;
@@ -286,10 +287,38 @@ function sendReportEmail({ reportId, imageUrl, posterInfo, reason }, cb) {
   req.end();
 }
 
+// ── HTTP-hjelper ─────────────────────────────────────────────────────────────
+
+/**
+ * Sender JSON-respons, komprimert med gzip hvis klienten støtter det.
+ * dart:io HttpClient dekomprimerer automatisk — appen trenger kun sende
+ * Accept-Encoding: gzip for å oppnå ~75 % båndbredde-reduksjon.
+ */
+function sendJson(req, res, data) {
+  const json = JSON.stringify(data);
+  const acceptEncoding = req.headers['accept-encoding'] || '';
+  if (acceptEncoding.includes('gzip')) {
+    zlib.gzip(json, (err, compressed) => {
+      if (err) {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(json);
+        return;
+      }
+      res.setHeader('Content-Encoding', 'gzip');
+      res.setHeader('Content-Type', 'application/json');
+      res.end(compressed);
+    });
+  } else {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(json);
+  }
+}
+
 // ── HTTP-server ───────────────────────────────────────────────────────────────
 
 const server = http.createServer((req, res) => {
-  const path = urlMod.parse(req.url).pathname;
+  const parsed = urlMod.parse(req.url, true);
+  const path   = parsed.pathname;
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -334,29 +363,39 @@ const server = http.createServer((req, res) => {
   }
 
   if (path === '/strikes') {
-    const cutoff = Date.now() - MAX_AGE_MS;
-    const fresh  = recentStrikes.filter(s => s.time / 1e6 > cutoff);
+    const cutoff  = Date.now() - MAX_AGE_MS;
+    const fresh   = recentStrikes.filter(s => s.time / 1e6 > cutoff);
     recentStrikes = fresh;
+    const sinceMs = parseInt(parsed.query.since, 10);
+    const payload = Number.isFinite(sinceMs)
+      ? fresh.filter(s => s.time / 1e6 > sinceMs)
+      : fresh;
+    const now = Date.now();
     res.writeHead(200);
-    res.end(JSON.stringify({
-      strikes:   fresh,
-      count:     fresh.length,
+    sendJson(req, res, {
+      strikes:   payload,
+      count:     payload.length,
       connected: connected,
       source:    'met-frost-lightning',
-      timestamp: Date.now(),
-    }));
+      timestamp: now,
+    });
   } else if (path === '/strikes-global') {
-    const cutoff = Date.now() - MAX_AGE_MS;
-    const fresh  = recentGlobalStrikes.filter(s => s.time / 1e6 > cutoff);
+    const cutoff        = Date.now() - MAX_AGE_MS;
+    const fresh         = recentGlobalStrikes.filter(s => s.time / 1e6 > cutoff);
     recentGlobalStrikes = fresh;
+    const sinceMs = parseInt(parsed.query.since, 10);
+    const payload = Number.isFinite(sinceMs)
+      ? fresh.filter(s => s.time / 1e6 > sinceMs)
+      : fresh;
+    const now = Date.now();
     res.writeHead(200);
-    res.end(JSON.stringify({
-      strikes:   fresh,
-      count:     fresh.length,
+    sendJson(req, res, {
+      strikes:   payload,
+      count:     payload.length,
       connected: globalConnected,
       source:    'blitzortung-mqtt-global',
-      timestamp: Date.now(),
-    }));
+      timestamp: now,
+    });
   } else if (path === '/health') {
     res.writeHead(200);
     res.end(JSON.stringify({
