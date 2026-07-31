@@ -40,7 +40,7 @@ const RESEND_API_KEY  = process.env.RESEND_API_KEY;
 const REPORT_EMAIL_TO = 'dinutvikler@gmail.com';
 
 const FROST_HOST     = 'frost-rc.met.no';
-const POLL_INTERVAL_MS  = 20 * 1000;
+const POLL_INTERVAL_MS  = 10 * 1000;
 // Frost-data kan komme med litt forsinkelse — vent med å "kreve" et
 // tidspunkt til det er minst dette gamalt.
 const PUBLISH_LAG_MS   = 60 * 1000;
@@ -152,9 +152,10 @@ function parseUalf(body) {
     recentStrikes.push({
       lat,
       lon,
-      time: timeNs,
-      mds: Number.isFinite(sensors) ? sensors : null,
-      intensity: Number.isFinite(peakCurrentKa) ? Math.abs(peakCurrentKa) : 0,
+      time:         timeNs,
+      receivedAt:   Date.now(),
+      mds:          Number.isFinite(sensors) ? sensors : null,
+      intensity:    Number.isFinite(peakCurrentKa) ? Math.abs(peakCurrentKa) : 0,
       multiplicity: Number.isFinite(multiplicity) ? multiplicity : null,
     });
     totalReceived++;
@@ -202,16 +203,32 @@ function connectBlitzortung() {
       return;
     }
     if (msg.lat === undefined || msg.lon === undefined) return;
-    if (isNordic(msg.lat, msg.lon)) return; // dekkes allerede av MET Frost
 
-    const timeNs = msg.time || (Date.now() * 1e6);
-    recentGlobalStrikes.push({
-      lat:       msg.lat,
-      lon:       msg.lon,
-      time:      timeNs,
-      mds:       (msg.mds !== undefined && msg.mds !== null) ? msg.mds : null,
-      intensity: 0, // Blitzortung gir ikke toppstrøm (kA)
-    });
+    const timeNs    = msg.time || (Date.now() * 1e6);
+    const receivedAt = Date.now();
+    const strike = {
+      lat:        msg.lat,
+      lon:        msg.lon,
+      time:       timeNs,
+      receivedAt,
+      mds:        (msg.mds !== undefined && msg.mds !== null) ? msg.mds : null,
+      intensity:  0, // Blitzortung gir ikke toppstrøm (kA)
+    };
+
+    if (isNordic(msg.lat, msg.lon)) {
+      // Nordic slag inkluderes i MET Frost-bufferen for sanntidsdekning.
+      // Blitzortung leverer data 2-5 sek etter nedslagstidspunktet —
+      // MET Frost-data med høyere kvalitet ankommer ca. 60-120 sek senere.
+      recentStrikes.push(strike);
+      totalReceived++;
+      if (recentStrikes.length > 5000) {
+        const cutoff = Date.now() - MAX_AGE_MS;
+        recentStrikes = recentStrikes.filter(s => s.time / 1e6 > cutoff);
+      }
+      return;
+    }
+
+    recentGlobalStrikes.push(strike);
     globalTotalReceived++;
 
     if (recentGlobalStrikes.length > 5000) {
@@ -368,7 +385,7 @@ const server = http.createServer((req, res) => {
     recentStrikes = fresh;
     const sinceMs = parseInt(parsed.query.since, 10);
     const payload = Number.isFinite(sinceMs)
-      ? fresh.filter(s => s.time / 1e6 > sinceMs)
+      ? fresh.filter(s => (s.receivedAt ?? s.time / 1e6) > sinceMs)
       : fresh;
     const now = Date.now();
     res.writeHead(200);
@@ -385,7 +402,7 @@ const server = http.createServer((req, res) => {
     recentGlobalStrikes = fresh;
     const sinceMs = parseInt(parsed.query.since, 10);
     const payload = Number.isFinite(sinceMs)
-      ? fresh.filter(s => s.time / 1e6 > sinceMs)
+      ? fresh.filter(s => (s.receivedAt ?? s.time / 1e6) > sinceMs)
       : fresh;
     const now = Date.now();
     res.writeHead(200);
