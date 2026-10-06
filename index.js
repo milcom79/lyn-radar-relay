@@ -36,6 +36,10 @@ const PORT       = process.env.PORT || 3000;
 const CLIENT_ID  = process.env.FROST_CLIENT_ID;
 const MAX_AGE_MS = 60 * 60 * 1000;
 
+// Når satt (f.eks. på Render etter flytting til egen server) svarer relayet
+// kun med 308-omdirigering hit, og henter ikke data selv.
+const REDIRECT_TO = (process.env.REDIRECT_TO || '').replace(/\/+$/, '');
+
 const RESEND_API_KEY  = process.env.RESEND_API_KEY;
 const REPORT_EMAIL_TO = 'dinutvikler@gmail.com';
 
@@ -347,6 +351,13 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (REDIRECT_TO && path !== '/health') {
+    // 308 bevarer metode og body (også for POST /report-image)
+    res.writeHead(308, { Location: REDIRECT_TO + req.url });
+    res.end();
+    return;
+  }
+
   if (path === '/report-image' && req.method === 'POST') {
     readBody(req, (raw) => {
       let data;
@@ -440,6 +451,10 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`[Relay] HTTP-server på port ${PORT}`);
+  if (REDIRECT_TO) {
+    console.log(`[Relay] Omdirigeringsmodus → ${REDIRECT_TO}`);
+    return;
+  }
   pollFrost();
   setInterval(pollFrost, POLL_INTERVAL_MS);
 
