@@ -399,7 +399,6 @@ const server = http.createServer((req, res) => {
       ? fresh.filter(s => (s.receivedAt ?? s.time / 1e6) > sinceMs)
       : fresh;
     const now = Date.now();
-    res.writeHead(200);
     sendJson(req, res, {
       strikes:   payload,
       count:     payload.length,
@@ -416,7 +415,6 @@ const server = http.createServer((req, res) => {
       ? fresh.filter(s => (s.receivedAt ?? s.time / 1e6) > sinceMs)
       : fresh;
     const now = Date.now();
-    res.writeHead(200);
     sendJson(req, res, {
       strikes:   payload,
       count:     payload.length,
