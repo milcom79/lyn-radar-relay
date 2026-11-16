@@ -95,8 +95,12 @@ const LI_POLL_INTERVAL_MS = 30 * 1000;
 const LI_STALE_MS         = 25 * 60 * 1000;
 
 // Uten ?since= sendes maks så mange (de nyeste) per kilde. Bufferne kan holde
-// godt over 100 000 lyn i timen; appen bruker uansett bare de nyeste per poll.
-const GLOBAL_MAX_FULL_PER_SOURCE = 2500;
+// godt over 100 000 lyn i timen. Standarden er lav fordi eldre appversjoner
+// henter hele svaret hvert 15. sekund i bakgrunnen og bare bruker de nyeste;
+// nyere versjoner ber om mer med ?limit= eller avgrenser med ?near=.
+const GLOBAL_DEFAULT_FULL_PER_SOURCE = 500;
+const GLOBAL_MAX_LIMIT_PER_SOURCE    = 20000;
+const NEAR_MAX_AREAS = 12;
 
 // ── Tilstand ─────────────────────────────────────────────────────────────────
 
@@ -664,6 +668,46 @@ function sendJson(req, res, data) {
   }
 }
 
+// ── Områdefilter (?near=lat,lon,km;lat,lon,km) ───────────────────────────────
+
+/**
+ * Tolker ?near= til en liste sirkler. Brukes av bakgrunnsvarslingen, som bare
+ * trenger lyn rundt brukeren og lagrede steder — ikke hele verden.
+ * Returnerer null når parameteren mangler, [] når den er ugyldig.
+ */
+function parseNear(raw) {
+  if (raw === undefined) return null;
+  const areas = [];
+  for (const part of String(raw).split(';').slice(0, NEAR_MAX_AREAS)) {
+    const [lat, lon, km] = part.split(',').map(Number);
+    if (![lat, lon, km].every(Number.isFinite)) continue;
+    if (lat < -90 || lat > 90 || lon < -180 || lon > 180 || km <= 0) continue;
+    const r    = Math.min(km, 2000);
+    const dLat = r / 111;
+    const dLon = dLat / Math.max(0.05, Math.cos(lat * Math.PI / 180));
+    areas.push({ lat, lon, km: r, dLat, dLon });
+  }
+  return areas;
+}
+
+function distanceKm(lat1, lon1, lat2, lon2) {
+  const rad = Math.PI / 180;
+  const a = Math.sin((lat2 - lat1) * rad / 2) ** 2
+    + Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin((lon2 - lon1) * rad / 2) ** 2;
+  return 12742 * Math.asin(Math.sqrt(a));
+}
+
+function isNear(s, areas) {
+  for (const a of areas) {
+    if (Math.abs(s.lat - a.lat) > a.dLat) continue;
+    let dLon = Math.abs(s.lon - a.lon);
+    if (dLon > 180) dLon = 360 - dLon;
+    if (dLon > a.dLon) continue;
+    if (distanceKm(a.lat, a.lon, s.lat, s.lon) <= a.km) return true;
+  }
+  return false;
+}
+
 // ── HTTP-server ───────────────────────────────────────────────────────────────
 
 const server = http.createServer((req, res) => {
@@ -724,9 +768,11 @@ const server = http.createServer((req, res) => {
     const fresh   = recentStrikes.filter(s => s.time / 1e6 > cutoff);
     recentStrikes = fresh;
     const sinceMs = parseInt(parsed.query.since, 10);
-    const payload = Number.isFinite(sinceMs)
+    const near = parseNear(parsed.query.near);
+    let payload = Number.isFinite(sinceMs)
       ? fresh.filter(s => (s.receivedAt ?? s.time / 1e6) > sinceMs)
       : fresh;
+    if (near) payload = payload.filter(s => isNear(s, near));
     const now = Date.now();
     sendJson(req, res, {
       strikes:   payload,
@@ -740,10 +786,18 @@ const server = http.createServer((req, res) => {
     recentGlobalStrikes = recentGlobalStrikes.filter(s => s.time / 1e6 > cutoff);
     recentLiStrikes     = recentLiStrikes.filter(s => s.time / 1e6 > cutoff);
     const sinceMs = parseInt(parsed.query.since, 10);
-    // Uten ?since= sendes bare de nyeste per kilde — bufferne kan være flere MB.
-    const pick = Number.isFinite(sinceMs)
-      ? (list) => list.filter(s => s.receivedAt > sinceMs)
-      : (list) => list.slice(-GLOBAL_MAX_FULL_PER_SOURCE);
+    const near   = parseNear(parsed.query.near);
+    const limitQ = parseInt(parsed.query.limit, 10);
+    const limit  = Number.isFinite(limitQ) && limitQ > 0
+      ? Math.min(limitQ, GLOBAL_MAX_LIMIT_PER_SOURCE)
+      : GLOBAL_DEFAULT_FULL_PER_SOURCE;
+    // ?near= avgrenser geografisk og sender alt innenfor. Ellers: med ?since=
+    // alt nytt, uten bare de nyeste per kilde — bufferne kan være flere MB.
+    const pick = (list) => {
+      const out = Number.isFinite(sinceMs) ? list.filter(s => s.receivedAt > sinceMs) : list;
+      if (near) return out.filter(s => isNear(s, near));
+      return Number.isFinite(sinceMs) ? out : out.slice(-limit);
+    };
     const payload = interleaveTail(pick(recentGlobalStrikes), pick(recentLiStrikes));
     const now = Date.now();
     sendJson(req, res, {
