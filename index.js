@@ -18,8 +18,13 @@
  * nøkkel. Én NetCDF-fil per satellitt hvert 20. sekund (produkt
  * GLM-L2-LCFA); vi leser «flash»-nivået (ett punkt per lyn).
  *
+ * EUMETSAT MTG LI (Europa, Afrika, Midtøsten, Atlanterhavet):
+ * Lightning Imager på MTG-I1 (0°). Produkt LI-2-LFL fra EUMETSAT Data Store,
+ * én NetCDF-fil per 10 minutter. Krever EUMETSAT_KEY og EUMETSAT_SECRET
+ * (consumer key/secret fra https://api.eumetsat.int/api-key/).
+ *
  * GET /strikes        → siste 60 min lynnedslag, Norden (MET Frost)
- * GET /strikes-global → siste 60 min lyn utenfor Norden (NOAA GOES GLM)
+ * GET /strikes-global → siste 60 min lyn utenfor Norden (GOES GLM + MTG LI)
  * GET /health         → serverstatus for begge kilder
  *
  * POST /report-image  → sender e-post (via Resend) om et rapportert bilde
@@ -63,7 +68,9 @@ const NORDIC_BOUNDS = { minLon: -8, maxLon: 41, minLat: 53, maxLat: 74 };
 // kommer fra den satellitten som ser det best.
 const GLM_SPLIT_LON = -106;
 const GLM_SATELLITES = [
-  { id: 'G19', bucket: 'noaa-goes19', accept: (lon) => lon >= GLM_SPLIT_LON },
+  // Øst for LI_SPLIT_LON overlater GOES-øst lynene til MTG LI — men bare
+  // mens LI faktisk leverer, ellers dekker GOES hele sitt synsfelt.
+  { id: 'G19', bucket: 'noaa-goes19', accept: (lon) => lon >= GLM_SPLIT_LON && (lon < LI_SPLIT_LON || !liConnected()) },
   { id: 'G18', bucket: 'noaa-goes18', accept: (lon) => lon <  GLM_SPLIT_LON },
 ];
 const GLM_PREFIX           = 'GLM-L2-LCFA/';
@@ -71,9 +78,25 @@ const GLM_POLL_INTERVAL_MS = 10 * 1000;
 const GLM_BACKFILL_MS      = 10 * 60 * 1000; // hentes ved oppstart
 const GLM_MAX_FILES_PER_POLL = 45;           // 15 min — eldre etterslep hoppes over
 const GLM_STALE_MS         = 3 * 60 * 1000;  // ingen ny fil så lenge → «ikke tilkoblet»
-// Uten ?since= sendes maks så mange (de nyeste). Bufferen kan holde godt over
-// 100 000 lyn i timen; appen bruker uansett bare de nyeste per poll.
-const GLOBAL_MAX_FULL_RESPONSE = 5000;
+
+// ── EUMETSAT MTG Lightning Imager (LI) ───────────────────────────────────────
+// Krever EUMETSAT_KEY og EUMETSAT_SECRET (consumer key/secret fra
+// https://api.eumetsat.int/api-key/). Uten dem hoppes LI over.
+const EUMETSAT_KEY    = process.env.EUMETSAT_KEY;
+const EUMETSAT_SECRET = process.env.EUMETSAT_SECRET;
+const LI_COLLECTION   = 'EO:EUM:DAT:0691'; // LI Lightning Flashes (LI-2-LFL)
+const LI_TOKEN_URL    = 'https://api.eumetsat.int/token';
+const LI_SEARCH_URL   = 'https://api.eumetsat.int/data/search-products/1.0.0/os'
+  + `?pi=${encodeURIComponent(LI_COLLECTION)}&format=json&sort=start,time,0&c=7`;
+// MTG-I1 står på 0° og GOES-øst på 75,2°V — midt mellom dem bytter vi kilde.
+const LI_SPLIT_LON        = -37.5;
+const LI_POLL_INTERVAL_MS = 30 * 1000;
+// Ett produkt per 10 minutter, publisert under ett minutt etter vinduets slutt.
+const LI_STALE_MS         = 25 * 60 * 1000;
+
+// Uten ?since= sendes maks så mange (de nyeste) per kilde. Bufferne kan holde
+// godt over 100 000 lyn i timen; appen bruker uansett bare de nyeste per poll.
+const GLOBAL_MAX_FULL_PER_SOURCE = 2500;
 
 // ── Tilstand ─────────────────────────────────────────────────────────────────
 
@@ -100,11 +123,28 @@ const glmState = GLM_SATELLITES.map((sat) => ({
 function glmConnected(st) {
   return st.lastFileAt > 0 && Date.now() - st.lastFileAt < GLM_STALE_MS;
 }
+// LI: egen buffer, slik at kildene kan trimmes og blandes hver for seg.
+let recentLiStrikes = [];
+const liState = {
+  token:        null,
+  tokenExpires: 0,
+  processed:    [],    // produkt-ID-er vi er ferdige med (nyeste sist)
+  lastFileAt:   0,
+  filesRead:    0,
+  flashesKept:  0,
+  lastError:    (EUMETSAT_KEY && EUMETSAT_SECRET) ? null : 'EUMETSAT_KEY/EUMETSAT_SECRET er ikke satt',
+  busy:         false,
+};
+
+function liConnected() {
+  return liState.lastFileAt > 0 && Date.now() - liState.lastFileAt < LI_STALE_MS;
+}
 function globalIsConnected() {
-  return glmState.some(glmConnected);
+  return glmState.some(glmConnected) || liConnected();
 }
 function globalLastError() {
   const errs = glmState.filter(st => st.lastError).map(st => `${st.sat.id}: ${st.lastError}`);
+  if (liState.lastError) errs.push(`LI: ${liState.lastError}`);
   return errs.length ? errs.join(' | ') : null;
 }
 
@@ -274,17 +314,38 @@ function attrNumber(dataset, name, fallback) {
 }
 
 /**
- * Leser «flash»-nivået fra en GLM-L2-LCFA-fil og returnerer
- * [{ lat, lon, timeMs }]. Tidspunktet er lagret som usignert 16-bit offset
- * (med scale_factor/add_offset) fra et starttidspunkt i `units`-attributtet.
+ * Åpner en NetCDF4-buffer med h5wasm (via en midlertidig fil, som h5wasm
+ * krever i Node) og kjører `read(file)`. Rydder alltid opp etterpå.
  */
-async function parseGlmFile(buffer) {
+async function withNetcdf(buffer, read) {
   const h5 = await loadH5();
-  const tmp = pathMod.join(os.tmpdir(), `glm-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.nc`);
+  const tmp = pathMod.join(os.tmpdir(), `lyn-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.nc`);
   await fs.promises.writeFile(tmp, buffer);
   let file = null;
   try {
     file = new h5.File(tmp, 'r');
+    return read(file);
+  } finally {
+    if (file) { try { file.close(); } catch { /* ignorer */ } }
+    fs.promises.unlink(tmp).catch(() => {});
+  }
+}
+
+/** Tolker «seconds since ÅÅÅÅ-MM-DD TT:MM:SS» → epoke-millisekunder (UTC). */
+function parseSinceUnits(dataset) {
+  const units = String(dataset.attrs.units ? dataset.attrs.units.value : '');
+  const m = units.match(/since (\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d):(\d\d(?:\.\d+)?)/);
+  if (!m) throw new Error(`ukjent tidsenhet: «${units}»`);
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], 0) + parseFloat(m[6]) * 1000;
+}
+
+/**
+ * Leser «flash»-nivået fra en GLM-L2-LCFA-fil og returnerer
+ * [{ lat, lon, timeMs }]. Tidspunktet er lagret som usignert 16-bit offset
+ * (med scale_factor/add_offset) fra et starttidspunkt i `units`-attributtet.
+ */
+function parseGlmFile(buffer) {
+  return withNetcdf(buffer, (file) => {
     const lats = file.get('flash_lat').value;
     const lons = file.get('flash_lon').value;
     const quality = file.get('flash_quality_flag').value;
@@ -293,11 +354,7 @@ async function parseGlmFile(buffer) {
     const scale = attrNumber(tDs, 'scale_factor', 1);
     const offset = attrNumber(tDs, 'add_offset', 0);
     const unsigned = String(tDs.attrs._Unsigned ? tDs.attrs._Unsigned.value : '') === 'true';
-
-    const units = String(tDs.attrs.units ? tDs.attrs.units.value : '');
-    const m = units.match(/since (\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d):(\d\d(?:\.\d+)?)/);
-    if (!m) throw new Error(`ukjent tidsenhet: «${units}»`);
-    const baseMs = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], 0) + parseFloat(m[6]) * 1000;
+    const baseMs = parseSinceUnits(tDs);
 
     const out = [];
     for (let i = 0; i < lats.length; i++) {
@@ -311,15 +368,41 @@ async function parseGlmFile(buffer) {
       out.push({ lat, lon, timeMs: Math.round(baseMs + (raw * scale + offset) * 1000) });
     }
     return out;
-  } finally {
-    if (file) { try { file.close(); } catch { /* ignorer */ } }
-    fs.promises.unlink(tmp).catch(() => {});
-  }
+  });
 }
 
 function trimGlobal() {
   const cutoff = Date.now() - MAX_AGE_MS;
   recentGlobalStrikes = recentGlobalStrikes.filter(s => s.time / 1e6 > cutoff);
+  recentLiStrikes     = recentLiStrikes.filter(s => s.time / 1e6 > cutoff);
+}
+
+/** Felles format for globale lyn (satellittmålinger). */
+function makeGlobalStrike(lat, lon, timeMs, receivedAt) {
+  return {
+    lat:  Math.round(lat * 1e4) / 1e4,
+    lon:  Math.round(lon * 1e4) / 1e4,
+    time: timeMs * 1e6,
+    receivedAt,
+    mds:       null, // satellittmåling — ingen bakkestasjoner
+    intensity: 0,    // optisk energi, ikke toppstrøm (kA)
+  };
+}
+
+/**
+ * Fletter to lister (begge eldst → nyest) slik at slutten av resultatet
+ * veksler mellom kildene. Appen leser bakfra og stopper etter et visst
+ * antall — uten fletting ville én kilde fortrengt den andre helt.
+ */
+function interleaveTail(a, b) {
+  const out = [];
+  let i = a.length - 1;
+  let j = b.length - 1;
+  while (i >= 0 || j >= 0) {
+    if (i >= 0) out.push(a[i--]);
+    if (j >= 0) out.push(b[j--]);
+  }
+  return out.reverse();
 }
 
 async function pollGlmSatellite(st) {
@@ -347,14 +430,7 @@ async function pollGlmSatellite(st) {
           if (!st.sat.accept(f.lon)) continue;      // den andre satellitten dekker dette
           if (isNordic(f.lat, f.lon)) continue;     // MET Frost dekker Norden
           if (f.timeMs < cutoff) continue;
-          recentGlobalStrikes.push({
-            lat:  Math.round(f.lat * 1e4) / 1e4,
-            lon:  Math.round(f.lon * 1e4) / 1e4,
-            time: f.timeMs * 1e6,
-            receivedAt,
-            mds:       null, // satellittmåling — ingen bakkestasjoner
-            intensity: 0,    // GLM måler optisk energi, ikke toppstrøm (kA)
-          });
+          recentGlobalStrikes.push(makeGlobalStrike(f.lat, f.lon, f.timeMs, receivedAt));
           globalTotalReceived++;
           st.flashesKept++;
         }
@@ -379,6 +455,128 @@ async function pollGlmSatellite(st) {
 
 function pollGlm() {
   for (const st of glmState) pollGlmSatellite(st);
+}
+
+// ── EUMETSAT MTG LI (Europa, Afrika, Midtøsten, Atlanterhavet) ───────────────
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  return fetch(url, { ...options, signal: AbortSignal.timeout(timeoutMs) });
+}
+
+/** Henter (og mellomlagrer) OAuth-token. Levetiden kan være kort — følg expires_in. */
+async function liToken() {
+  if (liState.token && Date.now() < liState.tokenExpires) return liState.token;
+  const basic = Buffer.from(`${EUMETSAT_KEY}:${EUMETSAT_SECRET}`).toString('base64');
+  const res = await fetchWithTimeout(LI_TOKEN_URL, {
+    method:  'POST',
+    headers: { Authorization: `Basic ${basic}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body:    'grant_type=client_credentials',
+  }, 20000);
+  if (!res.ok) throw new Error(`token HTTP ${res.status}`);
+  const json = await res.json();
+  if (!json.access_token) throw new Error('token mangler i svaret');
+  liState.token = json.access_token;
+  // 20 s margin, slik at tokenet ikke utløper midt i en nedlasting.
+  liState.tokenExpires = Date.now() + Math.max(0, (Number(json.expires_in) || 0) - 20) * 1000;
+  return liState.token;
+}
+
+/**
+ * Leser LI-2-LFL: latitude/longitude er skalerte 16-bit heltall, flash_time
+ * er sekunder siden 2000-01-01. `flash_filter_confidence` brukes ikke —
+ * sammenligning mot GLM viste at også lavverdi-lynene er ekte.
+ */
+function parseLiFile(buffer) {
+  return withNetcdf(buffer, (file) => {
+    const latDs = file.get('latitude');
+    const lonDs = file.get('longitude');
+    const tDs   = file.get('flash_time');
+    const lats  = latDs.value;
+    const lons  = lonDs.value;
+    const times = tDs.value;
+    const latScale = attrNumber(latDs, 'scale_factor', 1);
+    const latOff   = attrNumber(latDs, 'add_offset', 0);
+    const latFill  = attrNumber(latDs, '_FillValue', -32767);
+    const lonScale = attrNumber(lonDs, 'scale_factor', 1);
+    const lonOff   = attrNumber(lonDs, 'add_offset', 0);
+    const lonFill  = attrNumber(lonDs, '_FillValue', -32767);
+    const baseMs   = parseSinceUnits(tDs);
+
+    const out = [];
+    for (let i = 0; i < lats.length; i++) {
+      if (lats[i] === latFill || lons[i] === lonFill) continue;
+      const lat = lats[i] * latScale + latOff;
+      const lon = lons[i] * lonScale + lonOff;
+      const t   = Number(times[i]);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(t)) continue;
+      if (lat < -90 || lat > 90 || lon < -180 || lon > 180) continue;
+      out.push({ lat, lon, timeMs: Math.round(baseMs + t * 1000) });
+    }
+    return out;
+  });
+}
+
+async function pollLi() {
+  if (!EUMETSAT_KEY || !EUMETSAT_SECRET) return;
+  if (liState.busy) return;
+  liState.busy = true;
+  try {
+    const res = await fetchWithTimeout(LI_SEARCH_URL, {}, 20000);
+    if (!res.ok) throw new Error(`søk HTTP ${res.status}`);
+    const features = (await res.json()).features || [];
+
+    // Nyeste først fra API-et → behandle eldst først, og bare det som er nytt
+    // og fortsatt innenfor 60-minuttersvinduet.
+    const cutoff = Date.now() - MAX_AGE_MS;
+    const todo = features.filter((f) => {
+      if (liState.processed.includes(f.id)) return false;
+      const end = Date.parse(String(f.properties?.date || '').split('/')[1]);
+      return Number.isFinite(end) && end > cutoff;
+    }).reverse();
+
+    for (const f of todo) {
+      try {
+        const links = Object.values(f.properties?.links || {}).filter(Array.isArray).flat();
+        const body  = links.find((l) => /CHK-BODY/.test(l.href) && /\.nc$/.test(decodeURIComponent(l.href)));
+        if (!body) throw new Error('fant ikke datafilen (CHK-BODY) i produktet');
+
+        let dl = await fetchWithTimeout(body.href, { headers: { Authorization: `Bearer ${await liToken()}` } }, 60000);
+        if (dl.status === 401) {
+          liState.token = null; // utløpt i mellomtiden — prøv én gang til
+          dl = await fetchWithTimeout(body.href, { headers: { Authorization: `Bearer ${await liToken()}` } }, 60000);
+        }
+        if (!dl.ok) throw new Error(`nedlasting HTTP ${dl.status}`);
+        const flashes = await parseLiFile(Buffer.from(await dl.arrayBuffer()));
+
+        const receivedAt = Date.now();
+        const minTime    = receivedAt - MAX_AGE_MS;
+        for (const fl of flashes) {
+          if (fl.lon < LI_SPLIT_LON) continue;        // GOES-øst ser dette bedre
+          if (isNordic(fl.lat, fl.lon)) continue;     // MET Frost dekker Norden
+          if (fl.timeMs < minTime) continue;
+          recentLiStrikes.push(makeGlobalStrike(fl.lat, fl.lon, fl.timeMs, receivedAt));
+          globalTotalReceived++;
+          liState.flashesKept++;
+        }
+        liState.filesRead++;
+        liState.lastFileAt = Date.now();
+        liState.lastError  = null;
+        liState.processed.push(f.id);
+      } catch (e) {
+        // La produktet stå ubehandlet → nytt forsøk ved neste poll.
+        liState.lastError = e.message;
+        console.error('[Relay] LI produktfeil:', e.message);
+        break;
+      }
+    }
+    if (liState.processed.length > 50) liState.processed = liState.processed.slice(-50);
+    if (todo.length) trimGlobal();
+  } catch (e) {
+    liState.lastError = e.message;
+    console.error('[Relay] LI-feil:', e.message);
+  } finally {
+    liState.busy = false;
+  }
 }
 
 // ── Rapporter bilde (e-post via Resend) ────────────────────────────────────────
@@ -539,19 +737,20 @@ const server = http.createServer((req, res) => {
     });
   } else if (path === '/strikes-global') {
     const cutoff        = Date.now() - MAX_AGE_MS;
-    const fresh         = recentGlobalStrikes.filter(s => s.time / 1e6 > cutoff);
-    recentGlobalStrikes = fresh;
+    recentGlobalStrikes = recentGlobalStrikes.filter(s => s.time / 1e6 > cutoff);
+    recentLiStrikes     = recentLiStrikes.filter(s => s.time / 1e6 > cutoff);
     const sinceMs = parseInt(parsed.query.since, 10);
-    // Uten ?since= sendes bare de nyeste — hele bufferen kan være flere MB.
-    const payload = Number.isFinite(sinceMs)
-      ? fresh.filter(s => (s.receivedAt ?? s.time / 1e6) > sinceMs)
-      : fresh.slice(-GLOBAL_MAX_FULL_RESPONSE);
+    // Uten ?since= sendes bare de nyeste per kilde — bufferne kan være flere MB.
+    const pick = Number.isFinite(sinceMs)
+      ? (list) => list.filter(s => s.receivedAt > sinceMs)
+      : (list) => list.slice(-GLOBAL_MAX_FULL_PER_SOURCE);
+    const payload = interleaveTail(pick(recentGlobalStrikes), pick(recentLiStrikes));
     const now = Date.now();
     sendJson(req, res, {
       strikes:   payload,
       count:     payload.length,
       connected: globalIsConnected(),
-      source:    'noaa-goes-glm',
+      source:    'noaa-goes-glm+eumetsat-mtg-li',
       timestamp: now,
     });
   } else if (path === '/health') {
@@ -566,8 +765,8 @@ const server = http.createServer((req, res) => {
       global: {
         status:         globalIsConnected() ? 'ok' : 'error',
         connected:      globalIsConnected(),
-        source:         'noaa-goes-glm',
-        strikes_cached: recentGlobalStrikes.length,
+        source:         'noaa-goes-glm+eumetsat-mtg-li',
+        strikes_cached: recentGlobalStrikes.length + recentLiStrikes.length,
         total_received: globalTotalReceived,
         last_error:     globalLastError(),
         satellites: glmState.map((st) => ({
@@ -578,6 +777,15 @@ const server = http.createServer((req, res) => {
           last_file_age_sec: st.lastFileAt ? Math.round((Date.now() - st.lastFileAt) / 1000) : null,
           last_error:   st.lastError,
         })),
+        li: {
+          configured:   Boolean(EUMETSAT_KEY && EUMETSAT_SECRET),
+          connected:    liConnected(),
+          strikes_cached: recentLiStrikes.length,
+          files_read:   liState.filesRead,
+          flashes_kept: liState.flashesKept,
+          last_file_age_sec: liState.lastFileAt ? Math.round((Date.now() - liState.lastFileAt) / 1000) : null,
+          last_error:   liState.lastError,
+        },
       },
       uptime_sec:     Math.round(process.uptime()),
     }));
@@ -598,6 +806,9 @@ server.listen(PORT, () => {
 
   pollGlm();
   setInterval(pollGlm, GLM_POLL_INTERVAL_MS);
+
+  pollLi();
+  setInterval(pollLi, LI_POLL_INTERVAL_MS);
 
   // Keep-alive hvert 10. minutt — Render sover etter 15 min inaktivitet
   setInterval(() => {
