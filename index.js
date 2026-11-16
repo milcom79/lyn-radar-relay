@@ -1,9 +1,9 @@
 /**
- * Lyn Radar — MET Norway Frost Lightning Relay + Blitzortung global relay
+ * Lyn Radar — MET Norway Frost Lightning Relay + NOAA GOES GLM (Amerika)
  *
  * MET Frost (Norden):
  * Henter lynnedslag fra MET Norways Frost API (samme nettverk/datakilde
- * som radarkartet på yr.no bruker), i stedet for Blitzortung.
+ * som radarkartet på yr.no bruker).
  *
  * GET https://frost-rc.met.no/api/v1/lightning/get
  *   ?referencetime=<from>/<to>&format=ualf&geometry=POLYGON(...)
@@ -12,13 +12,14 @@
  * Krever miljøvariabelen FROST_CLIENT_ID (gratis client-ID fra
  * https://frost.met.no/auth/requestCredentials.html).
  *
- * Blitzortung (resten av verden, i tillegg til MET):
- * Kobler til Blitzortung sitt globale MQTT-endepunkt og holder en egen
- * buffer med slag UTENFOR det nordiske dekningsområdet (samme polygon som
- * Frost-spørringen), slik at de to kildene ikke overlapper.
+ * NOAA GOES GLM (Nord-/Sør-Amerika, Atlanterhavet, østlige Stillehavet):
+ * Geostationary Lightning Mapper på GOES-19 (øst) og GOES-18 (vest).
+ * Åpne data via NOAA Open Data Dissemination på AWS S3 — ingen konto eller
+ * nøkkel. Én NetCDF-fil per satellitt hvert 20. sekund (produkt
+ * GLM-L2-LCFA); vi leser «flash»-nivået (ett punkt per lyn).
  *
  * GET /strikes        → siste 60 min lynnedslag, Norden (MET Frost)
- * GET /strikes-global → siste 60 min lynnedslag, resten av verden (Blitzortung)
+ * GET /strikes-global → siste 60 min lyn utenfor Norden (NOAA GOES GLM)
  * GET /health         → serverstatus for begge kilder
  *
  * POST /report-image  → sender e-post (via Resend) om et rapportert bilde
@@ -30,7 +31,9 @@ const https  = require('https');
 const http   = require('http');
 const urlMod = require('url');
 const zlib   = require('zlib');
-const mqtt   = require('mqtt');
+const fs     = require('fs');
+const os     = require('os');
+const pathMod = require('path');
 
 const PORT       = process.env.PORT || 3000;
 const CLIENT_ID  = process.env.FROST_CLIENT_ID;
@@ -50,12 +53,27 @@ const POLL_INTERVAL_MS  = 10 * 1000;
 const PUBLISH_LAG_MS   = 60 * 1000;
 // Nordisk dekningsområde — samme region som yr-maps radar dekker.
 const GEOMETRY = 'POLYGON((-8 53, -8 74, 41 74, 41 53, -8 53))';
-// Samme område som bounding box — brukes til å luke ut Blitzortung-slag som
+// Samme område som bounding box — brukes til å luke ut globale lyn som
 // MET Frost allerede dekker, slik at kildene ikke overlapper.
 const NORDIC_BOUNDS = { minLon: -8, maxLon: 41, minLat: 53, maxLat: 74 };
 
-const MQTT_HOST  = 'mqtt://blitzortung.ha.sed.pl:1883';
-const MQTT_TOPIC = 'blitzortung/1.1/#';
+// ── NOAA GOES GLM ────────────────────────────────────────────────────────────
+// GOES-øst står på 75,2°V og GOES-vest på 137,2°V. Synsfeltene overlapper
+// over vestlige Nord-Amerika; vi deler på midten slik at hvert lyn bare
+// kommer fra den satellitten som ser det best.
+const GLM_SPLIT_LON = -106;
+const GLM_SATELLITES = [
+  { id: 'G19', bucket: 'noaa-goes19', accept: (lon) => lon >= GLM_SPLIT_LON },
+  { id: 'G18', bucket: 'noaa-goes18', accept: (lon) => lon <  GLM_SPLIT_LON },
+];
+const GLM_PREFIX           = 'GLM-L2-LCFA/';
+const GLM_POLL_INTERVAL_MS = 10 * 1000;
+const GLM_BACKFILL_MS      = 10 * 60 * 1000; // hentes ved oppstart
+const GLM_MAX_FILES_PER_POLL = 45;           // 15 min — eldre etterslep hoppes over
+const GLM_STALE_MS         = 3 * 60 * 1000;  // ingen ny fil så lenge → «ikke tilkoblet»
+// Uten ?since= sendes maks så mange (de nyeste). Bufferen kan holde godt over
+// 100 000 lyn i timen; appen bruker uansett bare de nyeste per poll.
+const GLOBAL_MAX_FULL_RESPONSE = 5000;
 
 // ── Tilstand ─────────────────────────────────────────────────────────────────
 
@@ -67,8 +85,28 @@ let lastFetchTo   = new Date(Date.now() - 5 * 60 * 1000); // liten backfill ved 
 
 let recentGlobalStrikes = [];
 let globalTotalReceived = 0;
-let globalConnected     = false;
-let globalLastError     = null;
+
+// Per satellitt: siste behandlede S3-nøkkel og status.
+const glmState = GLM_SATELLITES.map((sat) => ({
+  sat,
+  lastKey:      glmKeyForTime(sat, new Date(Date.now() - GLM_BACKFILL_MS)),
+  lastFileAt:   0,     // når vi sist leste en fil uten feil
+  filesRead:    0,
+  flashesKept:  0,
+  lastError:    null,
+  busy:         false,
+}));
+
+function glmConnected(st) {
+  return st.lastFileAt > 0 && Date.now() - st.lastFileAt < GLM_STALE_MS;
+}
+function globalIsConnected() {
+  return glmState.some(glmConnected);
+}
+function globalLastError() {
+  const errs = glmState.filter(st => st.lastError).map(st => `${st.sat.id}: ${st.lastError}`);
+  return errs.length ? errs.join(' | ') : null;
+}
 
 // ── Frost-polling ─────────────────────────────────────────────────────────────
 
@@ -173,81 +211,174 @@ function parseUalf(body) {
   }
 }
 
-// ── Blitzortung MQTT (global, utenfor Norden) ───────────────────────────────────
+// ── NOAA GOES GLM (Amerika, utenfor Norden) ──────────────────────────────────
 
 function isNordic(lat, lon) {
   return lat >= NORDIC_BOUNDS.minLat && lat <= NORDIC_BOUNDS.maxLat
       && lon >= NORDIC_BOUNDS.minLon && lon <= NORDIC_BOUNDS.maxLon;
 }
 
-function connectBlitzortung() {
-  const client = mqtt.connect(MQTT_HOST, {
-    clientId:        `lyn-relay-${Math.random().toString(16).slice(2, 8)}`,
-    keepalive:       60,
-    reconnectPeriod: 5000,
-    connectTimeout:  10000,
-  });
+function pad(n, len = 2) { return String(n).padStart(len, '0'); }
 
-  client.on('connect', () => {
-    globalConnected = true;
-    globalLastError = null;
-    client.subscribe(MQTT_TOPIC, { qos: 0 }, (err) => {
-      if (err) {
-        globalLastError = err.message;
-        console.error('[Relay] Blitzortung-abonnementsfeil:', err.message);
+/**
+ * Bygger en (syntetisk) S3-nøkkel for et tidspunkt. Nøklene sorterer
+ * kronologisk, så den kan brukes som `start-after` for å liste alt nyere.
+ * Format: GLM-L2-LCFA/<år>/<dag i året>/<time>/OR_GLM-L2-LCFA_G19_s<start>_e…
+ */
+function glmKeyForTime(sat, date) {
+  const y   = date.getUTCFullYear();
+  const doy = Math.floor((Date.UTC(y, date.getUTCMonth(), date.getUTCDate()) - Date.UTC(y, 0, 0)) / 86400000);
+  const hh  = pad(date.getUTCHours());
+  const stamp = `${y}${pad(doy, 3)}${hh}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}0`;
+  return `${GLM_PREFIX}${y}/${pad(doy, 3)}/${hh}/OR_GLM-L2-LCFA_${sat.id}_s${stamp}`;
+}
+
+function httpsGetBuffer(url, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { timeout: timeoutMs }, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error(`HTTP ${res.statusCode}`));
+        return;
       }
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('error', reject);
     });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('tidsavbrudd')));
   });
+}
 
-  client.on('message', (topic, payload) => {
-    let msg;
-    try {
-      msg = JSON.parse(payload.toString());
-    } catch {
-      return;
+// h5wasm (HDF5/NetCDF4-leser i WebAssembly) er en ES-modul → lastes dynamisk.
+let h5Promise = null;
+function loadH5() {
+  if (!h5Promise) {
+    h5Promise = import('h5wasm/node').then(async (m) => {
+      const h5 = m.default ?? m;
+      await h5.ready;
+      return h5;
+    });
+    h5Promise.catch(() => { h5Promise = null; });
+  }
+  return h5Promise;
+}
+
+function attrNumber(dataset, name, fallback) {
+  const a = dataset.attrs[name];
+  if (!a) return fallback;
+  const v = (a.value !== null && typeof a.value === 'object') ? a.value[0] : a.value;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/**
+ * Leser «flash»-nivået fra en GLM-L2-LCFA-fil og returnerer
+ * [{ lat, lon, timeMs }]. Tidspunktet er lagret som usignert 16-bit offset
+ * (med scale_factor/add_offset) fra et starttidspunkt i `units`-attributtet.
+ */
+async function parseGlmFile(buffer) {
+  const h5 = await loadH5();
+  const tmp = pathMod.join(os.tmpdir(), `glm-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.nc`);
+  await fs.promises.writeFile(tmp, buffer);
+  let file = null;
+  try {
+    file = new h5.File(tmp, 'r');
+    const lats = file.get('flash_lat').value;
+    const lons = file.get('flash_lon').value;
+    const quality = file.get('flash_quality_flag').value;
+    const tDs   = file.get('flash_time_offset_of_first_event');
+    const tRaw  = tDs.value;
+    const scale = attrNumber(tDs, 'scale_factor', 1);
+    const offset = attrNumber(tDs, 'add_offset', 0);
+    const unsigned = String(tDs.attrs._Unsigned ? tDs.attrs._Unsigned.value : '') === 'true';
+
+    const units = String(tDs.attrs.units ? tDs.attrs.units.value : '');
+    const m = units.match(/since (\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d):(\d\d(?:\.\d+)?)/);
+    if (!m) throw new Error(`ukjent tidsenhet: «${units}»`);
+    const baseMs = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], 0) + parseFloat(m[6]) * 1000;
+
+    const out = [];
+    for (let i = 0; i < lats.length; i++) {
+      if (quality[i] !== 0) continue; // 0 = godkjent lyn
+      const lat = lats[i];
+      const lon = lons[i];
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+      if (lat < -90 || lat > 90 || lon < -180 || lon > 180) continue;
+      let raw = Number(tRaw[i]);
+      if (unsigned && raw < 0) raw += 65536;
+      out.push({ lat, lon, timeMs: Math.round(baseMs + (raw * scale + offset) * 1000) });
     }
-    if (msg.lat === undefined || msg.lon === undefined) return;
+    return out;
+  } finally {
+    if (file) { try { file.close(); } catch { /* ignorer */ } }
+    fs.promises.unlink(tmp).catch(() => {});
+  }
+}
 
-    const timeNs    = msg.time || (Date.now() * 1e6);
-    const receivedAt = Date.now();
-    const strike = {
-      lat:        msg.lat,
-      lon:        msg.lon,
-      time:       timeNs,
-      receivedAt,
-      mds:        (msg.mds !== undefined && msg.mds !== null) ? msg.mds : null,
-      intensity:  0, // Blitzortung gir ikke toppstrøm (kA)
-    };
+function trimGlobal() {
+  const cutoff = Date.now() - MAX_AGE_MS;
+  recentGlobalStrikes = recentGlobalStrikes.filter(s => s.time / 1e6 > cutoff);
+}
 
-    if (isNordic(msg.lat, msg.lon)) {
-      // Nordic slag inkluderes i MET Frost-bufferen for sanntidsdekning.
-      // Blitzortung leverer data 2-5 sek etter nedslagstidspunktet —
-      // MET Frost-data med høyere kvalitet ankommer ca. 60-120 sek senere.
-      recentStrikes.push(strike);
-      totalReceived++;
-      if (recentStrikes.length > 5000) {
-        const cutoff = Date.now() - MAX_AGE_MS;
-        recentStrikes = recentStrikes.filter(s => s.time / 1e6 > cutoff);
+async function pollGlmSatellite(st) {
+  if (st.busy) return; // forrige runde holder fortsatt på
+  st.busy = true;
+  try {
+    const listUrl = `https://${st.sat.bucket}.s3.amazonaws.com/?list-type=2`
+      + `&prefix=${encodeURIComponent(GLM_PREFIX)}`
+      + `&start-after=${encodeURIComponent(st.lastKey)}`;
+    const xml = (await httpsGetBuffer(listUrl, 20000)).toString('utf8');
+    let keys = [...xml.matchAll(/<Key>([^<]+)<\/Key>/g)].map(m => m[1]).filter(k => k.endsWith('.nc'));
+
+    if (keys.length > GLM_MAX_FILES_PER_POLL) {
+      // Langt etterslep (f.eks. etter nettbrudd) — hopp til de nyeste.
+      keys = keys.slice(-GLM_MAX_FILES_PER_POLL);
+    }
+
+    for (const key of keys) {
+      try {
+        const buf     = await httpsGetBuffer(`https://${st.sat.bucket}.s3.amazonaws.com/${key}`, 30000);
+        const flashes = await parseGlmFile(buf);
+        const receivedAt = Date.now();
+        const cutoff     = receivedAt - MAX_AGE_MS;
+        for (const f of flashes) {
+          if (!st.sat.accept(f.lon)) continue;      // den andre satellitten dekker dette
+          if (isNordic(f.lat, f.lon)) continue;     // MET Frost dekker Norden
+          if (f.timeMs < cutoff) continue;
+          recentGlobalStrikes.push({
+            lat:  Math.round(f.lat * 1e4) / 1e4,
+            lon:  Math.round(f.lon * 1e4) / 1e4,
+            time: f.timeMs * 1e6,
+            receivedAt,
+            mds:       null, // satellittmåling — ingen bakkestasjoner
+            intensity: 0,    // GLM måler optisk energi, ikke toppstrøm (kA)
+          });
+          globalTotalReceived++;
+          st.flashesKept++;
+        }
+        st.filesRead++;
+        st.lastFileAt = Date.now();
+        st.lastError  = null;
+      } catch (e) {
+        // Én ødelagt fil skal ikke stoppe køen — logg og gå videre.
+        st.lastError = `${key.split('/').pop()}: ${e.message}`;
+        console.error(`[Relay] GLM ${st.sat.id} filfeil:`, st.lastError);
       }
-      return;
+      st.lastKey = key;
     }
+    if (keys.length) trimGlobal();
+  } catch (e) {
+    st.lastError = `liste: ${e.message}`;
+    console.error(`[Relay] GLM ${st.sat.id} listefeil:`, e.message);
+  } finally {
+    st.busy = false;
+  }
+}
 
-    recentGlobalStrikes.push(strike);
-    globalTotalReceived++;
-
-    if (recentGlobalStrikes.length > 5000) {
-      const cutoff = Date.now() - MAX_AGE_MS;
-      recentGlobalStrikes = recentGlobalStrikes.filter(s => s.time / 1e6 > cutoff);
-    }
-  });
-
-  client.on('reconnect', () => { globalConnected = false; });
-  client.on('offline',   () => { globalConnected = false; });
-  client.on('error', (e) => {
-    globalConnected = false;
-    globalLastError = e.message;
-    console.error('[Relay] Blitzortung-tilkoblingsfeil:', e.message);
-  });
+function pollGlm() {
+  for (const st of glmState) pollGlmSatellite(st);
 }
 
 // ── Rapporter bilde (e-post via Resend) ────────────────────────────────────────
@@ -411,15 +542,16 @@ const server = http.createServer((req, res) => {
     const fresh         = recentGlobalStrikes.filter(s => s.time / 1e6 > cutoff);
     recentGlobalStrikes = fresh;
     const sinceMs = parseInt(parsed.query.since, 10);
+    // Uten ?since= sendes bare de nyeste — hele bufferen kan være flere MB.
     const payload = Number.isFinite(sinceMs)
       ? fresh.filter(s => (s.receivedAt ?? s.time / 1e6) > sinceMs)
-      : fresh;
+      : fresh.slice(-GLOBAL_MAX_FULL_RESPONSE);
     const now = Date.now();
     sendJson(req, res, {
       strikes:   payload,
       count:     payload.length,
-      connected: globalConnected,
-      source:    'blitzortung-mqtt-global',
+      connected: globalIsConnected(),
+      source:    'noaa-goes-glm',
       timestamp: now,
     });
   } else if (path === '/health') {
@@ -432,12 +564,20 @@ const server = http.createServer((req, res) => {
       total_received: totalReceived,
       last_error:     lastError,
       global: {
-        status:         globalConnected ? 'ok' : 'error',
-        connected:      globalConnected,
-        source:         'blitzortung-mqtt-global',
+        status:         globalIsConnected() ? 'ok' : 'error',
+        connected:      globalIsConnected(),
+        source:         'noaa-goes-glm',
         strikes_cached: recentGlobalStrikes.length,
         total_received: globalTotalReceived,
-        last_error:     globalLastError,
+        last_error:     globalLastError(),
+        satellites: glmState.map((st) => ({
+          id:           st.sat.id,
+          connected:    glmConnected(st),
+          files_read:   st.filesRead,
+          flashes_kept: st.flashesKept,
+          last_file_age_sec: st.lastFileAt ? Math.round((Date.now() - st.lastFileAt) / 1000) : null,
+          last_error:   st.lastError,
+        })),
       },
       uptime_sec:     Math.round(process.uptime()),
     }));
@@ -456,12 +596,13 @@ server.listen(PORT, () => {
   pollFrost();
   setInterval(pollFrost, POLL_INTERVAL_MS);
 
-  connectBlitzortung();
+  pollGlm();
+  setInterval(pollGlm, GLM_POLL_INTERVAL_MS);
 
   // Keep-alive hvert 10. minutt — Render sover etter 15 min inaktivitet
   setInterval(() => {
     http.get({ host: 'localhost', port: PORT, path: '/health' }, (res) => {
-      console.log(`[Relay] Keep-alive: ${res.statusCode}, slag=${recentStrikes.length}, tilkoblet=${connected}, global=${recentGlobalStrikes.length}`);
+      console.log(`[Relay] Keep-alive: ${res.statusCode}, slag=${recentStrikes.length}, tilkoblet=${connected}, global=${recentGlobalStrikes.length}, glm=${globalIsConnected()}`);
     }).on('error', () => {});
   }, 10 * 60 * 1000);
 });
